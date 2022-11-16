@@ -32,11 +32,72 @@ import { IAutomatedWindow } from 'vs/platform/log/browser/log';
 import { ILogService } from 'vs/platform/log/common/log';
 import { IUserDataProfileService } from 'vs/workbench/services/userDataProfile/common/userDataProfile';
 import { dedupExtensions } from 'vs/workbench/services/extensions/common/extensionsUtil';
+import { ImplicitActivationEvents } from 'vs/platform/extensionManagement/common/implicitActivationEvents';
+
+class ExtensionScannerService {
+	constructor(
+		@IWebExtensionsScannerService private readonly _webExtensionsScannerService: IWebExtensionsScannerService,
+		@IRemoteAgentService private readonly _remoteAgentService: IRemoteAgentService,
+		@IUserDataProfileService private readonly _userDataProfileService: IUserDataProfileService,
+		@ILogService private readonly _logService: ILogService,
+	) { }
+
+	async scanExtensions(options?: { generateImplicitActivationEvents?: boolean }): Promise<{ localExtensions: IExtensionDescription[]; remoteExtensions: IExtensionDescription[] }> {
+		const localExtensions = await this._scanLocalExtensions();
+		const remoteExtensions = await this._remoteAgentService.scanExtensions();
+
+		if (options?.generateImplicitActivationEvents) {
+			localExtensions.forEach((manifest) => ImplicitActivationEvents.updateManifest(manifest));
+			remoteExtensions.forEach((manifest) => ImplicitActivationEvents.updateManifest(manifest));
+		}
+
+		return { localExtensions: localExtensions, remoteExtensions: remoteExtensions };
+	}
+
+	async scanExtension(extension: IExtension, options?: { generateImplicitActivationEvents?: boolean }): Promise<IExtensionDescription | null> {
+		const manifest = await this._scanExtension(extension);
+
+		if (options?.generateImplicitActivationEvents === true && manifest !== null) {
+			ImplicitActivationEvents.updateManifest(manifest);
+		}
+
+		return manifest;
+	}
+
+	private async _scanLocalExtensions(): Promise<IExtensionDescription[]> {
+		const system: IExtensionDescription[] = [], user: IExtensionDescription[] = [], development: IExtensionDescription[] = [];
+		try {
+			await Promise.all([
+				this._webExtensionsScannerService.scanSystemExtensions().then(extensions => system.push(...extensions.map(e => toExtensionDescription(e)))),
+				this._webExtensionsScannerService.scanUserExtensions(this._userDataProfileService.currentProfile.extensionsResource, { skipInvalidExtensions: true }).then(extensions => user.push(...extensions.map(e => toExtensionDescription(e)))),
+				this._webExtensionsScannerService.scanExtensionsUnderDevelopment().then(extensions => development.push(...extensions.map(e => toExtensionDescription(e, true))))
+			]);
+		} catch (error) {
+			this._logService.error(error);
+		}
+		return dedupExtensions(system, user, development, this._logService);
+	}
+
+	private async _scanExtension(extension: IExtension): Promise<IExtensionDescription | null> {
+		if (extension.location.scheme === Schemas.vscodeRemote) {
+			return this._remoteAgentService.scanSingleExtension(extension.location, extension.type === ExtensionType.System);
+		}
+
+		const scannedExtension = await this._webExtensionsScannerService.scanExistingExtension(extension.location, extension.type, this._userDataProfileService.currentProfile.extensionsResource);
+		if (scannedExtension) {
+			return toExtensionDescription(scannedExtension);
+		}
+
+		return null;
+	}
+}
+
 
 export class ExtensionService extends AbstractExtensionService implements IExtensionService {
 
 	private _disposables = new DisposableStore();
 	private _remoteInitData: IRemoteExtensionHostInitData | null = null;
+	private extensionScannerService: ExtensionScannerService;
 
 	constructor(
 		@IInstantiationService instantiationService: IInstantiationService,
@@ -50,7 +111,6 @@ export class ExtensionService extends AbstractExtensionService implements IExten
 		@IWorkspaceContextService contextService: IWorkspaceContextService,
 		@IConfigurationService configurationService: IConfigurationService,
 		@IExtensionManifestPropertiesService extensionManifestPropertiesService: IExtensionManifestPropertiesService,
-		@IWebExtensionsScannerService private readonly _webExtensionsScannerService: IWebExtensionsScannerService,
 		@ILogService logService: ILogService,
 		@IRemoteAgentService remoteAgentService: IRemoteAgentService,
 		@ILifecycleService lifecycleService: ILifecycleService,
@@ -76,6 +136,8 @@ export class ExtensionService extends AbstractExtensionService implements IExten
 			userDataProfileService
 		);
 
+		this.extensionScannerService = instantiationService.createInstance(ExtensionScannerService);
+
 		// Initialize installed extensions first and do it only after workbench is ready
 		lifecycleService.when(LifecyclePhase.Ready).then(async () => {
 			await this._userDataInitializationService.initializeInstalledExtensions(this._instantiationService);
@@ -91,16 +153,7 @@ export class ExtensionService extends AbstractExtensionService implements IExten
 	}
 
 	protected async _scanSingleExtension(extension: IExtension): Promise<IExtensionDescription | null> {
-		if (extension.location.scheme === Schemas.vscodeRemote) {
-			return this._remoteAgentService.scanSingleExtension(extension.location, extension.type === ExtensionType.System);
-		}
-
-		const scannedExtension = await this._webExtensionsScannerService.scanExistingExtension(extension.location, extension.type, this._userDataProfileService.currentProfile.extensionsResource);
-		if (scannedExtension) {
-			return toExtensionDescription(scannedExtension);
-		}
-
-		return null;
+		return this.extensionScannerService.scanExtension(extension, { generateImplicitActivationEvents: true });
 	}
 
 	private _initFetchFileSystem(): void {
@@ -192,27 +245,10 @@ export class ExtensionService extends AbstractExtensionService implements IExten
 		}
 	}
 
-	private async _scanWebExtensions(): Promise<IExtensionDescription[]> {
-		const system: IExtensionDescription[] = [], user: IExtensionDescription[] = [], development: IExtensionDescription[] = [];
-		try {
-			await Promise.all([
-				this._webExtensionsScannerService.scanSystemExtensions().then(extensions => system.push(...extensions.map(e => toExtensionDescription(e)))),
-				this._webExtensionsScannerService.scanUserExtensions(this._userDataProfileService.currentProfile.extensionsResource, { skipInvalidExtensions: true }).then(extensions => user.push(...extensions.map(e => toExtensionDescription(e)))),
-				this._webExtensionsScannerService.scanExtensionsUnderDevelopment().then(extensions => development.push(...extensions.map(e => toExtensionDescription(e, true))))
-			]);
-		} catch (error) {
-			this._logService.error(error);
-		}
-		return dedupExtensions(system, user, development, this._logService);
-	}
-
 	protected async _scanAndHandleExtensions(): Promise<void> {
 		// fetch the remote environment
-		let [localExtensions, remoteEnv, remoteExtensions] = await Promise.all([
-			this._scanWebExtensions(),
-			this._remoteAgentService.getEnvironment(),
-			this._remoteAgentService.scanExtensions()
-		]);
+		let { localExtensions, remoteExtensions } = await this.extensionScannerService.scanExtensions({ generateImplicitActivationEvents: true });
+		const remoteEnv = await this._remoteAgentService.getEnvironment();
 		localExtensions = this._checkEnabledAndProposedAPI(localExtensions, false);
 		remoteExtensions = this._checkEnabledAndProposedAPI(remoteExtensions, false);
 
